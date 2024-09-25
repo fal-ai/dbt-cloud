@@ -1,6 +1,7 @@
 const axios = require('axios');
 const core = require('@actions/core');
 const fs = require('fs');
+const os = require('os');
 const axiosRetry = require('axios-retry');
 const YAML = require('yaml')
 
@@ -78,7 +79,7 @@ async function runJob(account_id, job_id) {
       }
     }
 
-    // Type-checking equality becuase of boolean inputs
+    // Type-checking equality because of boolean inputs
     if (input !== '') {
       body[key] = input;
     }
@@ -129,6 +130,10 @@ async function executeAction() {
   const runId = jobRun.data.id;
 
   core.info(`Triggered job. ${jobRun.data.href}`);
+  // we save this info to clean up the job later if it is cancelled
+  fs.appendFileSync(process.env.GITHUB_STATE, `dbtCloudRunID=${jobRun.data.id}${os.EOL}`, {
+    encoding: 'utf8'
+  })
 
   let res;
   while (true) {
@@ -183,20 +188,49 @@ async function executeAction() {
   return outputs;
 }
 
-async function main() {
-  try {
-    const outputs = await executeAction();
-    const git_sha = outputs["git_sha"];
-    const run_id = outputs["run_id"];
 
-    // GitHub Action output
-    core.info(`dbt Cloud Job commit SHA is ${git_sha}`)
-    core.setOutput('git_sha', git_sha);
-    core.setOutput('run_id', run_id);
-  } catch (e) {
-    // Always fail in this case because it is not a dbt error
-    core.setFailed('There has been a problem with running your dbt cloud job:\n' + e.toString());
-    core.debug(e.stack)
+async function cleanupAction() {
+  const account_id = core.getInput('dbt_cloud_account_id');
+  const run_id = process.env.STATE_dbtCloudRunID;
+
+  // get the job status
+  let res = await getJobRun(account_id, run_id);
+
+  // if it is running and we wanted to wait for the end of the job, cancel it
+  if ((! res.data.is_complete) && core.getBooleanInput('wait_for_job')) {
+    core.info('Cancelling job...')
+    await dbt_cloud_api.post(`/accounts/${account_id}/runs/${run_id}/cancel/`);
+  } else {
+    core.info('Nothing to clean')
+  }
+
+}
+
+async function main() {
+  if (process.env.STATE_dbtCloudRunID === undefined) {
+    // we haven't created th job yet
+    try {
+      const outputs = await executeAction();
+      const git_sha = outputs["git_sha"];
+      const run_id = outputs["run_id"];
+  
+      // GitHub Action output
+      core.info(`dbt Cloud Job commit SHA is ${git_sha}`)
+      core.setOutput('git_sha', git_sha);
+      core.setOutput('run_id', run_id);
+    } catch (e) {
+      // Always fail in this case because it is not a dbt error
+      core.setFailed('There has been a problem with running your dbt cloud job:\n' + e.toString());
+      core.debug(e.stack)
+    }
+  } else {
+    // we have created the job
+    try {
+      await cleanupAction();
+    } catch (e) {
+      core.error('There has been a problem with cleaning up your dbt cloud job:\n' + e.toString());
+      core.debug(e.stack)
+    }
   }
 }
 
